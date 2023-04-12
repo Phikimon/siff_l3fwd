@@ -1,0 +1,2 @@
+Modified l3fwd example to implement algorithm described in 'SIFF: A Stateless Internet Flow Filter to Mitigate DDoS Flooding Attacks' paper. Dpdk version 21.11.2 stable:
+$ wget https://fast.dpdk.org/rel/dpdk-21.11.2.tar.xz
