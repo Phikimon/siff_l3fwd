@@ -13,8 +13,10 @@
 #include <errno.h>
 #include <getopt.h>
 #include <stdbool.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <openssl/md5.h>
 
 #include <rte_debug.h>
 #include <rte_ether.h>
@@ -39,6 +41,12 @@
 
 static struct rte_lpm *ipv4_l3fwd_lpm_lookup_struct[NB_SOCKETS];
 static struct rte_lpm6 *ipv6_l3fwd_lpm_lookup_struct[NB_SOCKETS];
+
+#define IPV4_OPT_SIFF 0x4A
+#define IPV4_OPT_SIFF_CAP_SIZE 4
+#define IPV4_OPT_SIFF_DTA_MASK 0x80
+#define IPV4_OPT_SIFF_CU_MASK 0x40
+#define IPV4_OPT_SIFF_MARKING_MASK 0x0F
 
 /* Performing LPM-based lookups. 8< */
 static inline uint16_t
@@ -129,15 +137,370 @@ lpm_get_dst_port_with_ipv4(const struct lcore_conf *qconf, struct rte_mbuf *pkt,
 	return portid;
 }
 
-#if defined(RTE_ARCH_X86)
-#include "l3fwd_lpm_sse.h"
-#elif defined __ARM_NEON
-#include "l3fwd_lpm_neon.h"
-#elif defined(RTE_ARCH_PPC_64)
-#include "l3fwd_lpm_altivec.h"
-#else
-#include "l3fwd_lpm.h"
+#undef RTE_ARCH_X86
+
+static uint8_t*
+find_ipv4_option(uint8_t *ipv4_hdr, uint8_t option_number)
+{
+#define IPV4_IHL_MASK 0x0F
+#define IPV4_OPT_EOOL 0
+#define IPV4_OPT_NOP 1
+	if (ipv4_hdr == NULL)
+		return NULL;
+
+	uint8_t ihl = ipv4_hdr[0] & IPV4_IHL_MASK;
+	if (ihl < 5)
+		return NULL;
+
+	uint8_t options_len = (ihl - 5) * 4;
+	if (options_len == 0)
+		return NULL;
+
+	uint8_t *opt_ptr = ipv4_hdr + 20;
+
+	while (options_len > 0) {
+		uint8_t opt = *opt_ptr;
+		if (opt == IPV4_OPT_EOOL) {
+			break;
+		} else if (opt == IPV4_OPT_NOP) {
+			opt_ptr++;
+			options_len--;
+		} else {
+			uint8_t opt_len = *(opt_ptr + 1);
+			if (options_len < opt_len || opt_len < 2)
+				break;
+
+			if (opt == option_number)
+				return opt_ptr;
+
+			opt_ptr += opt_len;
+			options_len -= opt_len;
+		}
+	}
+
+	return NULL;
+#undef IPV4_IHL_MASK
+#undef IPV4_OPT_EOOL
+#undef IPV4_OPT_NOP
+}
+
+int
+process_dta_cap(uint8_t* cap_ptr, uint8_t new_marking, uint8_t old_marking) {
+	// A mask to extract the 2 most significant bits (PT and CU flags)
+	uint32_t msb_mask = 0xC0000000;
+
+	uint32_t capability = ((uint32_t)cap_ptr[0] << 24) |
+		((uint32_t)cap_ptr[1] << 16) |
+		((uint32_t)cap_ptr[2] << 8) |
+		(uint32_t)cap_ptr[3];
+
+	// Save the PT and CU flags
+	uint32_t msb = capability & msb_mask;
+
+	// Clear the flags from the capability
+	capability &= ~msb_mask;
+	fprintf(stderr, "%d: marking in packet %01X\n", __LINE__, capability & IPV4_OPT_SIFF_MARKING_MASK);
+
+	// Check if this router's marking is correct
+	if ((capability & IPV4_OPT_SIFF_MARKING_MASK) != new_marking &&
+		(capability & IPV4_OPT_SIFF_MARKING_MASK) != old_marking) {
+		// Drop the packet
+		return 1;
+	}
+
+	// Shift the new marking to the 4 most significant bits of the capability
+	// (skipping the space occupied by flags)
+	capability = (capability >> 4) | (new_marking << 24);
+
+	// Restore the flags
+	capability |= msb;
+
+	cap_ptr[0] = (uint8_t)(capability >> 24);
+	cap_ptr[1] = (uint8_t)(capability >> 16);
+	cap_ptr[2] = (uint8_t)(capability >> 8);
+	cap_ptr[3] = (uint8_t)(capability);
+
+	return 0;
+}
+
+void
+process_exp_cap(uint8_t* cap_ptr, uint8_t marking) {
+	// A mask to extract the 2 most significant bits (PT and CU flags)
+	uint32_t msb_mask = 0xC0000000;
+
+	uint32_t capability = ((uint32_t)cap_ptr[0] << 24) |
+		((uint32_t)cap_ptr[1] << 16) |
+		((uint32_t)cap_ptr[2] << 8) |
+		(uint32_t)cap_ptr[3];
+
+	// Save the PT and CU flags
+	uint32_t msb = capability & msb_mask;
+
+	// Clear the flags from the capability
+	capability &= ~msb_mask;
+
+	// If the capability is zero, append 1 bit to the left of the marking
+	// (as per the paper)
+	if (capability == 0) {
+		marking |= 0x10;
+	}
+
+	capability = (capability << 4) | marking;
+
+	// Restore the flags
+	capability |= msb;
+
+	cap_ptr[0] = (uint8_t)(capability >> 24);
+	cap_ptr[1] = (uint8_t)(capability >> 16);
+	cap_ptr[2] = (uint8_t)(capability >> 8);
+	cap_ptr[3] = (uint8_t)(capability);
+}
+
+/* Arguments should be pointers to 4-byte arrays (i.e. IP addresses) */
+unsigned int
+marking_hash(size_t count, uint8_t key, ...)
+{
+	MD5_CTX c;
+	unsigned char digest[16];
+	va_list args;
+	int i, j;
+
+	va_start(args, key);
+	MD5_Init(&c);
+
+	MD5_Update(&c, &key, 1);
+
+	for (i = 0; i < count; i++) {
+		const uint8_t* bytes = va_arg(args, const uint8_t*);
+
+		MD5_Update(&c, bytes, 4);
+	}
+
+	MD5_Final(digest, &c);
+	va_end(args);
+
+	return digest[15] & 0xF;
+}
+
+static uint16_t ones_complement_sum(uint16_t a, uint16_t b)
+{
+	uint32_t sum = (uint32_t)a + (uint32_t)b;
+	sum = (sum & 0xFFFF) + (sum >> 16);
+	sum = (sum & 0xFFFF) + (sum >> 16);
+	return (uint16_t)(sum & 0xFFFF);
+}
+
+static uint16_t ipv4_options_cksum(const struct rte_ipv4_hdr* ipv4_hdr)
+{
+	uint16_t* data = (uint16_t*)(ipv4_hdr+1);
+	uint16_t cksum = 0;
+	int i;
+	for (i = 0; i < (ipv4_hdr->ihl-5)*2; i++) {
+		cksum = ones_complement_sum(cksum, rte_be_to_cpu_16(*data));
+		data++;
+	}
+	return cksum;
+}
+
+static void
+handle_siff(struct rte_ipv4_hdr* ipv4_hdr, int* is_dropping, int* is_priority)
+{
+	uint8_t *option_ptr = find_ipv4_option((uint8_t*)ipv4_hdr, IPV4_OPT_SIFF);
+	if (option_ptr == NULL) {
+		*is_dropping = 0;
+		*is_priority = 0;
+		return;
+	}
+
+	int is_dta = !!(option_ptr[2] & IPV4_OPT_SIFF_DTA_MASK);
+	int is_exp = !is_dta;
+	int is_cu = !!(option_ptr[2] & IPV4_OPT_SIFF_CU_MASK);
+	fprintf(stderr, "is_dta = %d, is_exp = %d, is_cu = %d\n",
+			is_dta, is_exp, is_cu);
+
+	// Verify option length
+	int optlen = option_ptr[1];
+	if (optlen != 2 + (1+is_cu) * IPV4_OPT_SIFF_CAP_SIZE) {
+		*is_dropping = 0;
+		*is_priority = 0;
+		return;
+	}
+
+	static time_t timecode = 0;
+	time_t new_timecode = time(NULL) / 15;
+	static uint8_t key = 0;
+	if (new_timecode != timecode) {
+		timecode = new_timecode;
+		key++;
+		fprintf(stderr, "_________________________CHANGING KEY = %d_________________________\n", key);
+	}
+	// Endianness doesn't matter for hashing
+	const uint8_t* src_addr = (const uint8_t*)&ipv4_hdr->src_addr;
+	const uint8_t* dst_addr = (const uint8_t*)&ipv4_hdr->dst_addr;
+	/* last hop routers IP address and this interface's IP address
+	 * can also be added in the mix, this is why marking_hash()
+	 * accepts arbitraty number of arguments */
+	uint8_t new_marking = (uint8_t)marking_hash(2, key,     src_addr, dst_addr);
+	new_marking += (new_marking == 0); // The paper has a 'bug' - zero markings do not work
+	fprintf(stderr, "%d: new_marking %01X\n", __LINE__, new_marking);
+
+	uint8_t old_marking = (uint8_t)marking_hash(2, key - 1, src_addr, dst_addr);
+	old_marking += (old_marking == 0); // The paper has a 'bug' - zero markings do not work
+	fprintf(stderr, "%d: old_marking %01X\n", __LINE__, old_marking);
+
+	uint8_t expired_marking = (uint8_t)marking_hash(2, key - 2, src_addr, dst_addr);
+	expired_marking += (expired_marking == 0);
+	fprintf(stderr, "%d: expired_marking %01X\n", __LINE__, expired_marking);
+
+	if (is_exp) {
+		process_exp_cap(&option_ptr[2], new_marking);
+		*is_dropping = 0;
+		*is_priority = 0;
+	} else if (is_dta) {
+		if (process_dta_cap(&option_ptr[2], new_marking, old_marking)) {
+			*is_dropping = 1;
+			*is_priority = 0;
+		} else {
+			*is_dropping = 0;
+			*is_priority = 1;
+		}
+	}
+
+}
+
+static inline void
+l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
+		struct lcore_conf *qconf)
+{
+	struct rte_ether_hdr *eth_hdr;
+	struct rte_ipv4_hdr *ipv4_hdr;
+	uint16_t dst_port;
+
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+	if (RTE_ETH_IS_IPV4_HDR(m->packet_type)) {
+		/* Handle IPv4 headers.*/
+		ipv4_hdr = rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *,
+						sizeof(struct rte_ether_hdr));
+
+#ifdef DO_RFC_1812_CHECKS
+		/* Check to make sure the packet is valid (RFC1812) */
+		if (is_valid_ipv4_pkt(ipv4_hdr, m->pkt_len) < 0) {
+			rte_pktmbuf_free(m);
+			return;
+		}
 #endif
+
+		int siff_compliant = 0;
+		if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+			struct rte_udp_hdr *udp;
+			udp = rte_pktmbuf_mtod_offset(m, struct rte_udp_hdr *,
+					sizeof(struct rte_ether_hdr)+(ipv4_hdr->ihl*4));
+			if (rte_be_to_cpu_16(udp->dst_port) == 54321 || rte_be_to_cpu_16(udp->src_port) == 54321) {
+				siff_compliant = 1;
+				RTE_LOG(INFO, L3FWD, "\n\nPort %d: received a UDP %d/%d packet!\n", portid,
+						rte_be_to_cpu_16(udp->dst_port), rte_be_to_cpu_16(udp->src_port));
+				int is_dropping = 0, is_priority = 0;
+
+				uint16_t old_cksum = ipv4_options_cksum(ipv4_hdr);
+
+				handle_siff(ipv4_hdr, &is_dropping, &is_priority);
+
+				int16_t cksum_difference = ones_complement_sum(ipv4_options_cksum(ipv4_hdr), ~old_cksum);
+
+				// see https://www.rfc-editor.org/rfc/rfc1071
+				ipv4_hdr->hdr_checksum = ones_complement_sum(ipv4_hdr->hdr_checksum, ~rte_be_to_cpu_16(cksum_difference));
+
+				fprintf(stderr, "is_drop = %d, is_prio = %d\n", is_dropping, is_priority);
+				if (is_dropping) {
+					fprintf(stderr, "Dropping a packet with wrong marking\n");
+					rte_pktmbuf_free(m);
+					return;
+				}
+				if (!is_priority) {
+					fprintf(stderr, "Low priority packet\n");
+					///if ((time(NULL) / 3) % 2) {
+					///	fprintf(stderr, "Dropping low priority packet\n");
+					///	rte_pktmbuf_free(m);
+					///	return;
+					///}
+				}
+				if (!is_dropping && is_priority)
+					fprintf(stderr, "High priority packet\n");
+			}
+		}
+
+		dst_port = lpm_get_ipv4_dst_port(ipv4_hdr, portid,
+						qconf->ipv4_lookup_struct);
+
+		if (dst_port >= RTE_MAX_ETHPORTS ||
+			(enabled_port_mask & 1 << dst_port) == 0)
+			dst_port = portid;
+
+#ifdef DO_RFC_1812_CHECKS
+		/* Update time to live and header checksum */
+		--(ipv4_hdr->time_to_live);
+		++(ipv4_hdr->hdr_checksum);
+#endif
+		/* dst addr */
+		*(uint64_t *)&eth_hdr->dst_addr = dest_eth_addr[dst_port];
+
+		/* src addr */
+		rte_ether_addr_copy(&ports_eth_addr[dst_port],
+				&eth_hdr->src_addr);
+
+		send_single_packet(qconf, m, dst_port);
+	} else if (RTE_ETH_IS_IPV6_HDR(m->packet_type)) {
+		/* Handle IPv6 headers.*/
+		struct rte_ipv6_hdr *ipv6_hdr;
+
+		ipv6_hdr = rte_pktmbuf_mtod_offset(m, struct rte_ipv6_hdr *,
+						sizeof(struct rte_ether_hdr));
+
+		dst_port = lpm_get_ipv6_dst_port(ipv6_hdr, portid,
+					qconf->ipv6_lookup_struct);
+
+		if (dst_port >= RTE_MAX_ETHPORTS ||
+			(enabled_port_mask & 1 << dst_port) == 0)
+			dst_port = portid;
+
+		/* dst addr */
+		*(uint64_t *)&eth_hdr->dst_addr = dest_eth_addr[dst_port];
+
+		/* src addr */
+		rte_ether_addr_copy(&ports_eth_addr[dst_port],
+				&eth_hdr->src_addr);
+
+		send_single_packet(qconf, m, dst_port);
+	} else {
+		/* Free the mbuf that contains non-IPV4/IPV6 packet */
+		rte_pktmbuf_free(m);
+	}
+	/* We can process ARP requests here */
+}
+
+static inline void
+l3fwd_lpm_no_opt_send_packets(int nb_rx, struct rte_mbuf **pkts_burst,
+				uint16_t portid, struct lcore_conf *qconf)
+{
+	int32_t j;
+
+	/* Prefetch first packets */
+	for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++)
+		rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j], void *));
+
+	/* Prefetch and forward already prefetched packets. */
+	for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
+		rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[
+				j + PREFETCH_OFFSET], void *));
+		l3fwd_lpm_simple_forward(pkts_burst[j], portid, qconf);
+	}
+
+	/* Forward remaining prefetched packets */
+	for (; j < nb_rx; j++)
+		l3fwd_lpm_simple_forward(pkts_burst[j], portid, qconf);
+}
+
 
 /* main processing loop */
 int
@@ -248,7 +611,7 @@ lpm_process_event_pkt(const struct lcore_conf *lconf, struct rte_mbuf *mbuf)
 		if (is_valid_ipv4_pkt(ipv4_hdr, mbuf->pkt_len)
 				< 0) {
 			mbuf->port = BAD_PORT;
-			continue;
+			return mbuf->port;
 		}
 		/* Update time to live and header checksum */
 		--(ipv4_hdr->time_to_live);

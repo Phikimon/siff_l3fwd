@@ -48,8 +48,8 @@
 #include "l3fwd_event.h"
 #include "l3fwd_route.h"
 
-#define MAX_TX_QUEUE_PER_PORT RTE_MAX_LCORE
-#define MAX_RX_QUEUE_PER_PORT 128
+#define MAX_TX_QUEUE_PER_PORT 1 // RTE_MAX_LCORE
+#define MAX_RX_QUEUE_PER_PORT 1 // 128
 
 #define MAX_LCORE_PARAMS 1024
 
@@ -198,6 +198,10 @@ const struct ipv4_l3fwd_route ipv4_l3fwd_route_array[] = {
 	{RTE_IPV4(198, 18, 13, 0), 24, 13},
 	{RTE_IPV4(198, 18, 14, 0), 24, 14},
 	{RTE_IPV4(198, 18, 15, 0), 24, 15},
+
+	// here go the routes
+	{RTE_IPV4(192, 168, 65, 0), 24, 0},
+	{RTE_IPV4(192, 168, 64, 0), 24, 1},
 };
 
 /*
@@ -1239,9 +1243,9 @@ l3fwd_poll_resource_setup(void)
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "init_mem failed\n");
 
-		/* init one TX queue per couple (lcore,port) */
+		/* init one TX queue for each port */
 		queueid = 0;
-		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+		for (lcore_id = portid+1; lcore_id < portid+2; lcore_id++) {
 			if (rte_lcore_is_enabled(lcore_id) == 0)
 				continue;
 

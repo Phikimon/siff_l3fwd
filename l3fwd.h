@@ -132,9 +132,9 @@ send_single_packet(struct lcore_conf *qconf,
 	qconf->tx_mbufs[port].m_table[len] = m;
 	len++;
 
-	/* enough pkts to be sent */
-	if (unlikely(len == MAX_PKT_BURST)) {
-		send_burst(qconf, MAX_PKT_BURST, port);
+	/* send each packet immediately when ready */
+	if (unlikely(len >= 1)) {
+		send_burst(qconf, len, port);
 		len = 0;
 	}
 
